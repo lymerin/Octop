@@ -26,6 +26,7 @@
 
 ### 修复
 
+- 修复桌面版覆盖安装新版 beta 后仍使用旧运行环境，以及便携版程序内升级重复解析依赖导致超时的问题；随包提供 uv，独立启动脚本将升级安装到实际加载的 packages 目录。升级校验读取目标目录的最新版本元数据，避免 pip 遗留旧 dist-info 造成误判；同版本和旧版本在安装前拒绝（#1562）。
 - 邮箱连接器读取含裸非 ASCII 字节邮件头（如未 MIME 编码的中文发件人/主题）时崩溃 `Object of type Header is not JSON serializable`：`search_emails`/`read_email` 改用 `email.policy.default` 解析并统一 `str()` 转换，同时自动解码 MIME 编码头为可读文本；正文中声明未知字符集（如 `unknown-8bit`）时回退 UTF-8 而非抛 `LookupError`。影响所有基于该通用 IMAP/SMTP 适配器的邮箱（QQ/网易/Gmail 等）。
 ### 新增
 - 专家可配置默认对话模式（Ask / Plan / Craft）：新建 / 编辑专家及从专家创建时可选，新建对话与无模式粘性的线程（含 IM / CLI / cron 渠道）按该默认解析，缺省为 Craft；已有对话保持各自粘性的模式不变（Fixes #1310）。

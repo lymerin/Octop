@@ -285,10 +285,117 @@ func TestCompareVersions(t *testing.T) {
 		{"0.9.31", "0.9.32", -1},
 		{"1.0", "1.0.0", 0},
 		{"0.9.32rc1", "0.9.31", 1},
+		{"1.0.2b5", "1.0.2b4", 1},
+		{"1.0.2b4", "1.0.2b5", -1},
+		{"1.0.2b10", "1.0.2b9", 1},
+		{"1.0.2b1", "1.0.2a9", 1},
+		{"1.0.2rc1", "1.0.2b5", 1},
+		{"1.0.2", "1.0.2rc1", 1},
+		{"1.0.2b5", "1.0.2", -1},
+		{"1.0.2-beta.5", "1.0.2b5", 0},
+		{" v1.0.2RC1 ", "1.0.2rc1", 0},
+		{"1.0.2.dev2", "1.0.2.dev1", 1},
+		{"1.0.2a1", "1.0.2.dev2", 1},
+		{"1.0.2b5", "1.0.2b5.dev1", 1},
+		{"1.0.2.post1", "1.0.2", 1},
+		{"1.0.2.post1.dev1", "1.0.2", 1},
+		{"1.0.2.post1", "1.0.2.post1.dev1", 1},
+		{"1!1.0.2", "2.0.0", 1},
 	} {
 		if got := compareVersions(test.left, test.right); got != test.want {
 			t.Fatalf("compareVersions(%q, %q) = %d, want %d", test.left, test.right, got, test.want)
 		}
+	}
+}
+
+func TestEnsurePortablePrereleaseUpgrade(t *testing.T) {
+	for _, test := range []struct {
+		name, current, bundled, want string
+		backupFails, invalidBundle   bool
+		wantBackupCalls              int
+	}{
+		{"beta upgrade", "1.0.2b4", "1.0.2b5", "1.0.2b5", false, false, 1},
+		{"numeric beta order", "1.0.2b9", "1.0.2b10", "1.0.2b10", false, false, 1},
+		{"beta to rc", "1.0.2b5", "1.0.2rc1", "1.0.2rc1", false, false, 1},
+		{"rc to final", "1.0.2rc1", "1.0.2", "1.0.2", false, false, 1},
+		{"same version", "1.0.2b5", "1.0.2b5", "1.0.2b5", false, false, 0},
+		{"newer installed metadata", "1.0.2", "1.0.2b5", "1.0.2", false, false, 0},
+		{"backup failure", "1.0.2b4", "1.0.2b5", "1.0.2b4", true, false, 1},
+		{"replacement failure", "1.0.2b4", "1.0.2b5", "1.0.2b4", false, true, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("OCTOP_HOME", home)
+			root := portableDir()
+			currentZip := filepath.Join(t.TempDir(), "current.zip")
+			writeTestGreenZip(t, currentZip, test.current)
+			if err := unzipGreen(currentZip, root); err != nil {
+				t.Fatal(err)
+			}
+			// This marker proves backup precedes replacement and failures preserve files.
+			marker := filepath.Join(root, "old-runtime.txt")
+			if err := os.WriteFile(marker, []byte("preserve until backup finishes"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if test.wantBackupCalls == 0 {
+				// Online updates may leave VERSION.txt behind the installed metadata.
+				if err := os.WriteFile(filepath.Join(root, "VERSION.txt"), []byte("octop_version=1.0.2b4\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			database := filepath.Join(home, "octop.db")
+			if err := os.WriteFile(database, []byte("database"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			backupCalls := 0
+			previousBackup := runSQLiteBackup
+			runSQLiteBackup = func(_ string, source, destination string) error {
+				backupCalls++
+				if source != database || portableVersion(root) != test.current {
+					t.Fatal("backup must read the original database before runtime replacement")
+				}
+				if _, err := os.Stat(marker); err != nil {
+					t.Fatalf("original runtime missing during backup: %v", err)
+				}
+				if test.backupFails {
+					return errors.New("backup unavailable")
+				}
+				return os.WriteFile(destination, []byte("database backup"), 0o600)
+			}
+			t.Cleanup(func() { runSQLiteBackup = previousBackup })
+			bundledZip := filepath.Join(t.TempDir(), "bundled.zip")
+			if test.invalidBundle {
+				writeVersionOnlyZip(t, bundledZip, test.bundled)
+			} else {
+				writeTestGreenZip(t, bundledZip, test.bundled)
+			}
+			t.Setenv("OCTOP_DESKTOP_PORTABLE_ZIP", bundledZip)
+			err := ensurePortable(LocaleZH, func(string) {})
+			if (err != nil) != test.backupFails {
+				t.Fatalf("ensurePortable error = %v, backupFails = %v", err, test.backupFails)
+			}
+			if got := portableVersion(root); got != test.want {
+				t.Fatalf("portable version = %q, want %q", got, test.want)
+			}
+			if !launchReady(root) {
+				t.Fatal("resulting runtime must remain launchable")
+			}
+			if backupCalls != test.wantBackupCalls {
+				t.Fatalf("backup calls = %d, want %d", backupCalls, test.wantBackupCalls)
+			}
+			_, markerErr := os.Stat(marker)
+			if (markerErr == nil) != (test.want == test.current) {
+				t.Fatalf("original runtime marker = %v, current = %s, result = %s", markerErr, test.current, test.want)
+			}
+			if !test.backupFails && !test.invalidBundle {
+				if err := ensurePortable(LocaleZH, func(string) {}); err != nil {
+					t.Fatalf("repeat startup failed: %v", err)
+				}
+				if backupCalls != test.wantBackupCalls {
+					t.Fatal("repeat startup must not make another backup")
+				}
+			}
+		})
 	}
 }
 
